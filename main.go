@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,13 @@ type Transaction struct {
 	Price          string `json:"price_adjusted"`
 	Total          string `json:"total"`
 	Source         string `json:"source"`
+}
+
+// Estrutura para representar um lote de compra
+type Lot struct {
+	Date     time.Time
+	Quantity float64
+	Price    float64
 }
 
 // Estrutura para armazenar dados do ativo
@@ -84,7 +92,7 @@ func loadConfig() *Config {
 		Port:            getEnv("PORT", "4000"),
 		Host:            getEnv("HOST", "localhost"),
 		Investidor10ID:  getEnv("INVESTIDOR10_ID", "1399345"),
-		Investidor10URL: "https://investidor10.com.br/api/carteiras/lancamentos",
+		Investidor10URL: getEnv("INVESTIDOR10_URL", "https://investidor10.com.br/api/carteiras/lancamentos"),
 	}
 
 	return config
@@ -126,6 +134,111 @@ func parsePrice(price string) float64 {
 	return value
 }
 
+// Função para parsear data no formato DD/MM/YYYY
+func parseDate(dateStr string) time.Time {
+	parts := strings.Split(dateStr, "/")
+	if len(parts) != 3 {
+		return time.Time{}
+	}
+
+	day := 0
+	month := 0
+	year := 0
+
+	fmt.Sscanf(parts[0], "%d", &day)
+	fmt.Sscanf(parts[1], "%d", &month)
+	fmt.Sscanf(parts[2], "%d", &year)
+
+	return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+}
+
+// Calcula posição usando FIFO
+func calculateFIFOPosition(transactions []Transaction) (quantity float64, averagePrice float64, totalInvested float64) {
+	// Debug: mostra todas as transações
+	log.Printf("\nDEBUG - Processando %d transações", len(transactions))
+
+	// Separa compras e vendas
+	var purchases []Lot
+	var totalSold float64
+
+	for _, tx := range transactions {
+		qty := parsePrice(tx.Qty)
+		price := parsePrice(tx.Price)
+		total := parsePrice(tx.Total)
+		date := parseDate(tx.Date)
+
+		// Debug: mostra valores parseados
+		log.Printf("DEBUG - %s %s: Qty=%s (%.2f), Price=%s (%.2f), Total=%s (%.2f)",
+			tx.Type, tx.Date, tx.Qty, qty, tx.Price, price, tx.Total, total)
+
+		// Calcula o preço unitário correto (Total / Qty)
+		if qty > 0 && total > 0 {
+			price = total / qty
+			log.Printf("DEBUG - Preço unitário calculado: R$ %.2f", price)
+		}
+
+		if tx.Type == "Compra" {
+			purchases = append(purchases, Lot{
+				Date:     date,
+				Quantity: qty,
+				Price:    price,
+			})
+		} else if tx.Type == "Venda" {
+			totalSold += qty
+		}
+	}
+
+	// Ordena compras por data (FIFO - mais antigas primeiro)
+	sort.Slice(purchases, func(i, j int) bool {
+		return purchases[i].Date.Before(purchases[j].Date)
+	})
+
+	log.Printf("DEBUG - Total comprado: %.2f unidades", func() float64 {
+		sum := 0.0
+		for _, p := range purchases {
+			sum += p.Quantity
+		}
+		return sum
+	}())
+	log.Printf("DEBUG - Total vendido: %.2f unidades", totalSold)
+
+	// Aplica vendas usando FIFO
+	remainingSold := totalSold
+	var remainingLots []Lot
+
+	for _, lot := range purchases {
+		if remainingSold == 0 {
+			remainingLots = append(remainingLots, lot)
+		} else if remainingSold >= lot.Quantity {
+			// Lote totalmente vendido
+			remainingSold -= lot.Quantity
+		} else {
+			// Lote parcialmente vendido
+			remainingLots = append(remainingLots, Lot{
+				Date:     lot.Date,
+				Quantity: lot.Quantity - remainingSold,
+				Price:    lot.Price,
+			})
+			remainingSold = 0
+		}
+	}
+
+	// Calcula quantidade, valor investido e preço médio dos lotes restantes
+	for _, lot := range remainingLots {
+		quantity += lot.Quantity
+		totalInvested += lot.Quantity * lot.Price
+	}
+
+	if quantity > 0 {
+		averagePrice = totalInvested / quantity
+	}
+
+	log.Printf("DEBUG - Quantidade restante: %.2f, Preço médio: R$ %.2f, Total investido: R$ %.2f\n",
+		quantity, averagePrice, totalInvested)
+
+	return quantity, averagePrice, totalInvested
+}
+
 // Busca dados da API
 func (pm *PortfolioManager) fetchPortfolioData() error {
 	url := fmt.Sprintf("%s/%s/1?draw=1", pm.config.Investidor10URL, pm.config.Investidor10ID)
@@ -147,12 +260,15 @@ func (pm *PortfolioManager) fetchPortfolioData() error {
 		return err
 	}
 
+	// Debug: mostra primeiro registro para ver estrutura
+	if len(apiResp.Data) > 0 {
+		log.Printf("DEBUG - Primeiro registro: %+v", apiResp.Data[0])
+		log.Printf("DEBUG - Price: %s, Total: %s", apiResp.Data[0].Price, apiResp.Data[0].Total)
+	}
+
 	// Agrupa transações por ticker
 	transactions := make(map[string][]Transaction)
 	for _, tx := range apiResp.Data {
-		if tx.Source != "B3" || tx.Type != "Compra" {
-			continue
-		}
 		transactions[tx.Ticker] = append(transactions[tx.Ticker], tx)
 	}
 
@@ -161,29 +277,25 @@ func (pm *PortfolioManager) fetchPortfolioData() error {
 	defer pm.mu.Unlock()
 
 	for ticker, txs := range transactions {
-		var totalQty float64
-		var totalInvested float64
+		// Calcula posição usando FIFO
+		quantity, averagePrice, totalInvested := calculateFIFOPosition(txs)
 
-		for _, tx := range txs {
-			qty := parsePrice(tx.Qty)
-			total := parsePrice(tx.Total)
-
-			totalQty += qty
-			totalInvested += total
+		// Se vendeu tudo, não adiciona ao portfolio
+		if quantity <= 0 {
+			log.Printf("%s %s: Posição encerrada", txs[0].TypeInvestment, ticker)
+			continue
 		}
-
-		averagePrice := totalInvested / totalQty
 
 		pm.assets[ticker] = &Asset{
 			Ticker:         ticker,
 			TypeInvestment: txs[0].TypeInvestment,
-			Quantity:       totalQty,
+			Quantity:       quantity,
 			AveragePrice:   averagePrice,
 			TotalInvested:  totalInvested,
 		}
 
-		log.Printf("%s %s: %.2f unidades @ R$ %.2f (total investido: R$ %.2f)",
-			txs[0].TypeInvestment, ticker, totalQty, averagePrice, totalInvested)
+		log.Printf("%s %s: %.2f unidades @ R$ %.2f (investido: R$ %.2f)",
+			txs[0].TypeInvestment, ticker, quantity, averagePrice, totalInvested)
 	}
 
 	return nil
@@ -346,6 +458,39 @@ func (pm *PortfolioManager) handleIndex(w http.ResponseWriter, r *http.Request) 
 	http.ServeFile(w, r, "index.html")
 }
 
+// Handler para API de resumo da carteira
+func (pm *PortfolioManager) handlePortfolioSummary(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	summary := struct {
+		TotalAssets   int      `json:"totalAssets"`
+		TotalInvested float64  `json:"totalInvested"`
+		CurrentTotal  float64  `json:"currentTotal"`
+		TotalProfit   float64  `json:"totalProfit"`
+		ProfitPercent float64  `json:"profitPercent"`
+		Assets        []*Asset `json:"assets"`
+	}{}
+
+	for _, asset := range pm.assets {
+		asset.mu.RLock()
+		summary.TotalAssets++
+		summary.TotalInvested += asset.TotalInvested
+		summary.CurrentTotal += asset.CurrentTotal
+		summary.TotalProfit += asset.ProfitLoss
+		summary.Assets = append(summary.Assets, asset)
+		asset.mu.RUnlock()
+	}
+
+	if summary.TotalInvested > 0 {
+		summary.ProfitPercent = (summary.TotalProfit / summary.TotalInvested) * 100
+	}
+
+	json.NewEncoder(w).Encode(summary)
+}
+
 func main() {
 	// Carrega configurações
 	config := loadConfig()
@@ -388,13 +533,14 @@ func main() {
 	r := mux.NewRouter()
 	r.HandleFunc("/", pm.handleIndex)
 	r.HandleFunc("/ws", pm.handleWebSocket)
+	r.HandleFunc("/api/portfolio", pm.handlePortfolioSummary).Methods("GET")
 
 	// Serve arquivos estáticos (caso precise de CSS/JS separados no futuro)
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("./static/"))))
 
 	// Inicia servidor
 	addr := fmt.Sprintf(":%s", config.Port)
-	log.Printf("Servidor rodando em http://%s", addr)
+	log.Printf("Servidor rodando em http://%s%s", config.Host, addr)
 	if err := http.ListenAndServe(addr, r); err != nil {
 		log.Fatalf("Erro ao iniciar servidor: %v", err)
 	}
