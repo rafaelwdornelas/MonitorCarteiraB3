@@ -171,6 +171,10 @@
             font-size: 0.7rem;
         }
 
+        tr {
+            transition: all 0.3s ease;
+        }
+
         tr:hover {
             background: rgba(255, 255, 255, 0.03);
         }
@@ -193,18 +197,31 @@
             color: #888;
         }
 
-        .price-update {
-            animation: flash 0.5s ease-in-out;
-        }
-
-        @keyframes flash {
+        /* Animação melhorada para atualização de preços */
+        @keyframes priceUpdate {
             0% {
-                background-color: rgba(0, 212, 255, 0.15);
+                background-color: transparent;
+            }
+
+            25% {
+                background-color: rgba(0, 212, 255, 0.2);
+                transform: scale(1.01);
+            }
+
+            50% {
+                background-color: rgba(0, 212, 255, 0.3);
+                transform: scale(1.02);
             }
 
             100% {
                 background-color: transparent;
+                transform: scale(1);
             }
+        }
+
+        .price-update {
+            animation: priceUpdate 1s ease-in-out !important;
+            position: relative !important;
         }
 
         .empty-state {
@@ -330,6 +347,13 @@
         }
 
         function updateAsset(data) {
+            // Verifica se é uma atualização de preço
+            const existingAsset = assets[data.ticker];
+            const isPriceUpdate = existingAsset &&
+                (existingAsset.currentPrice !== data.currentPrice ||
+                    existingAsset.currentTotal !== data.currentTotal ||
+                    existingAsset.profitLoss !== data.profitLoss);
+
             assets[data.ticker] = data;
 
             // Organiza por tipo
@@ -339,8 +363,87 @@
             }
             assetsByType[type][data.ticker] = data;
 
-            renderTables();
-            updateTotals();
+            // Se for primeira carga ou novo ativo, renderiza tudo
+            if (isFirstLoad || !existingAsset) {
+                renderTables();
+                updateTotals();
+            } else if (isPriceUpdate) {
+                // Se for apenas atualização de preço, atualiza só a linha
+                updateSpecificRow(data, type);
+                updateTotals();
+                updateSectionStats(type);
+            }
+        }
+
+        function updateSpecificRow(asset, type) {
+            const tbody = document.getElementById(`tbody-${type}`);
+            if (!tbody) {
+                renderTables();
+                return;
+            }
+
+            // Encontra a linha existente
+            const rows = tbody.getElementsByTagName('tr');
+            for (let i = 0; i < rows.length; i++) {
+                const row = rows[i];
+                if (row.dataset.ticker === asset.ticker) {
+                    // Atualiza os dados
+                    row.dataset.currentPrice = asset.currentPrice;
+                    row.dataset.currentTotal = asset.currentTotal;
+                    row.dataset.profitLoss = asset.profitLoss;
+                    row.dataset.profitLossPerc = asset.profitLossPerc;
+
+                    // Atualiza as células
+                    const cells = row.getElementsByTagName('td');
+                    cells[4].textContent = formatCurrency(asset.currentPrice);
+                    cells[5].textContent = formatCurrency(asset.currentTotal);
+                    cells[6].className = getColorClass(asset.profitLoss);
+                    cells[6].textContent = formatCurrency(asset.profitLoss);
+                    cells[7].className = getColorClass(asset.profitLossPerc);
+                    cells[7].textContent = formatPercent(asset.profitLossPerc);
+
+                    // Aplica animação
+                    row.classList.remove('price-update');
+                    // Força reflow
+                    void row.offsetWidth;
+                    row.classList.add('price-update');
+
+                    // Remove animação após conclusão
+                    setTimeout(() => {
+                        row.classList.remove('price-update');
+                    }, 1000);
+
+                    console.log(`Atualização aplicada em ${asset.ticker} (${type})`);
+                    break;
+                }
+            }
+        }
+
+        function updateSectionStats(type) {
+            const section = document.getElementById(`section-${type}`);
+            if (!section || !assetsByType[type]) return;
+
+            // Calcula totais da seção
+            let sectionInvested = 0;
+            let sectionCurrent = 0;
+            Object.values(assetsByType[type]).forEach(asset => {
+                sectionInvested += asset.totalInvested;
+                sectionCurrent += asset.currentTotal;
+            });
+            const sectionProfit = sectionCurrent - sectionInvested;
+            const sectionProfitPerc = sectionInvested > 0 ? (sectionProfit / sectionInvested) * 100 : 0;
+
+            // Atualiza apenas os valores nos spans existentes
+            const statsElement = section.querySelector('.section-stats');
+            if (statsElement) {
+                statsElement.innerHTML = `
+                    <span>Investido: ${formatCurrency(sectionInvested)}</span>
+                    <span>Atual: ${formatCurrency(sectionCurrent)}</span>
+                    <span class="${getColorClass(sectionProfit)}">
+                        Lucro: ${formatCurrency(sectionProfit)} (${formatPercent(sectionProfitPerc)})
+                    </span>
+                `;
+            }
         }
 
         // Função para definir ordenação padrão para todos os tipos
@@ -349,8 +452,8 @@
             types.forEach(type => {
                 if (!currentSort[type]) {
                     currentSort[type] = {
-                        field: 'profitLossPerc',
-                        direction: 'desc'
+                        field: 'ticker',
+                        direction: 'asc'
                     };
                 }
             });
@@ -392,6 +495,11 @@
 
             typeOrder.forEach(type => {
                 if (!assetsByType[type] || Object.keys(assetsByType[type]).length === 0) {
+                    // Remove seção se não há mais ativos
+                    const existingSection = document.getElementById(`section-${type}`);
+                    if (existingSection) {
+                        existingSection.remove();
+                    }
                     return;
                 }
 
@@ -401,7 +509,21 @@
                     section = document.createElement('div');
                     section.id = `section-${type}`;
                     section.className = 'investment-section';
-                    container.appendChild(section);
+
+                    // Insere na posição correta
+                    let inserted = false;
+                    const existingSections = container.querySelectorAll('.investment-section');
+                    for (let i = 0; i < existingSections.length; i++) {
+                        const existingType = existingSections[i].id.replace('section-', '');
+                        if (typeOrder.indexOf(type) < typeOrder.indexOf(existingType)) {
+                            container.insertBefore(section, existingSections[i]);
+                            inserted = true;
+                            break;
+                        }
+                    }
+                    if (!inserted) {
+                        container.appendChild(section);
+                    }
                 }
 
                 // Calcula totais da seção
@@ -500,6 +622,14 @@
 
             assetArray.forEach(asset => {
                 const row = document.createElement('tr');
+
+                // Define os dados no dataset
+                row.dataset.ticker = asset.ticker;
+                row.dataset.currentPrice = asset.currentPrice;
+                row.dataset.currentTotal = asset.currentTotal;
+                row.dataset.profitLoss = asset.profitLoss;
+                row.dataset.profitLossPerc = asset.profitLossPerc;
+
                 row.innerHTML = `
                     <td class="ticker">${asset.ticker}</td>
                     <td>${asset.quantity.toFixed(2)}</td>
@@ -510,6 +640,7 @@
                     <td class="${getColorClass(asset.profitLoss)}">${formatCurrency(asset.profitLoss)}</td>
                     <td class="${getColorClass(asset.profitLossPerc)}">${formatPercent(asset.profitLossPerc)}</td>
                 `;
+
                 tbody.appendChild(row);
             });
         }
