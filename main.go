@@ -57,6 +57,62 @@ type Asset struct {
 	mu             sync.RWMutex
 }
 
+// Estruturas para notícias
+type NewsResponse struct {
+	Items     []NewsItem `json:"items"`
+	Streaming struct {
+		Channel string `json:"channel"`
+	} `json:"streaming"`
+}
+
+type NewsItem struct {
+	ID             string          `json:"id"`
+	Title          string          `json:"title"`
+	Published      int64           `json:"published"`
+	Urgency        int             `json:"urgency"`
+	Link           string          `json:"link"`
+	RelatedSymbols []RelatedSymbol `json:"relatedSymbols"`
+	StoryPath      string          `json:"storyPath"`
+	Provider       NewsProvider    `json:"provider"`
+}
+
+type RelatedSymbol struct {
+	Symbol string `json:"symbol"`
+	LogoID string `json:"logoid"`
+}
+
+type NewsProvider struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	LogoID string `json:"logo_id"`
+	URL    string `json:"url"`
+}
+
+// Cliente WebSocket com controle individual de notícias
+type WSClient struct {
+	conn     *websocket.Conn
+	seenNews map[string]bool // Notícias já vistas por este cliente
+	mu       sync.RWMutex
+}
+
+// NewsMonitor gerencia o monitoramento de notícias
+type NewsMonitor struct {
+	allNews      map[string]NewsItem // Todas as notícias encontradas
+	newsByTicker map[string][]string // IDs de notícias por ticker
+	mu           sync.RWMutex
+	wsClients    map[*websocket.Conn]*WSClient
+	wsMu         *sync.RWMutex
+	lastCheck    time.Time
+}
+
+// NewsAlert representa um alerta de notícia para o WebSocket
+type NewsAlert struct {
+	Type      string    `json:"type"`
+	Ticker    string    `json:"ticker"`
+	News      NewsItem  `json:"news"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 // Configurações da aplicação
 type Config struct {
 	Port            string
@@ -70,9 +126,10 @@ type PortfolioManager struct {
 	assets      map[string]*Asset
 	mu          sync.RWMutex
 	tradingView *tv.API
-	wsClients   map[*websocket.Conn]bool
+	wsClients   map[*websocket.Conn]*WSClient
 	wsMu        sync.RWMutex
 	config      *Config
+	newsMonitor *NewsMonitor
 }
 
 var upgrader = websocket.Upgrader{
@@ -108,9 +165,243 @@ func getEnv(key, defaultValue string) string {
 func NewPortfolioManager(config *Config) *PortfolioManager {
 	return &PortfolioManager{
 		assets:    make(map[string]*Asset),
-		wsClients: make(map[*websocket.Conn]bool),
+		wsClients: make(map[*websocket.Conn]*WSClient),
 		config:    config,
 	}
+}
+
+func NewNewsMonitor(wsClients map[*websocket.Conn]*WSClient, wsMu *sync.RWMutex) *NewsMonitor {
+	return &NewsMonitor{
+		allNews:      make(map[string]NewsItem),
+		newsByTicker: make(map[string][]string),
+		wsClients:    wsClients,
+		wsMu:         wsMu,
+		lastCheck:    time.Now(),
+	}
+}
+
+// Inicia o monitoramento de notícias
+func (nm *NewsMonitor) StartMonitoring(pm *PortfolioManager) {
+	// Primeira verificação imediata
+	go nm.checkAllNews(pm)
+
+	// Verificações periódicas a cada minuto
+	ticker := time.NewTicker(1 * time.Minute)
+	go func() {
+		for range ticker.C {
+			nm.checkAllNews(pm)
+		}
+	}()
+}
+
+// Verifica notícias de todos os ativos
+func (nm *NewsMonitor) checkAllNews(pm *PortfolioManager) {
+	pm.mu.RLock()
+	tickers := make([]string, 0, len(pm.assets))
+	for ticker := range pm.assets {
+		tickers = append(tickers, ticker)
+	}
+	pm.mu.RUnlock()
+
+	log.Printf("Verificando notícias para %d ativos...", len(tickers))
+
+	var wg sync.WaitGroup
+	for _, ticker := range tickers {
+		wg.Add(1)
+		go func(t string) {
+			defer wg.Done()
+			nm.checkNewsForTicker(t)
+		}(ticker)
+	}
+	wg.Wait()
+
+	nm.lastCheck = time.Now()
+}
+
+// Verifica notícias para um ticker específico
+func (nm *NewsMonitor) checkNewsForTicker(ticker string) {
+	url := fmt.Sprintf("https://news-mediator.tradingview.com/news-flow/v2/news?filter=lang:pt&filter=symbol:BMFBOVESPA:%s&client=screener&streaming=true", ticker)
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		log.Printf("Erro ao buscar notícias para %s: %v", ticker, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Status code %d ao buscar notícias para %s", resp.StatusCode, ticker)
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Erro ao ler resposta de notícias para %s: %v", ticker, err)
+		return
+	}
+
+	var newsResp NewsResponse
+	if err := json.Unmarshal(body, &newsResp); err != nil {
+		log.Printf("Erro ao parsear notícias para %s: %v", ticker, err)
+		return
+	}
+
+	// Processa notícias
+	todayStart := time.Now().Truncate(24 * time.Hour).Unix()
+
+	for _, news := range newsResp.Items {
+		// Verifica se a notícia é de hoje
+		if news.Published < todayStart {
+			continue
+		}
+
+		// Verifica se já temos essa notícia
+		nm.mu.RLock()
+		_, exists := nm.allNews[news.ID]
+		nm.mu.RUnlock()
+
+		if !exists {
+			// Nova notícia encontrada!
+			nm.mu.Lock()
+			nm.allNews[news.ID] = news
+			nm.newsByTicker[ticker] = append(nm.newsByTicker[ticker], news.ID)
+			nm.mu.Unlock()
+
+			log.Printf("NOVA NOTÍCIA para %s: %s - %s", ticker, news.Title, news.Link)
+
+			// Envia alerta para clientes que ainda não viram
+			nm.sendNewsAlertToClients(ticker, news)
+		}
+	}
+}
+
+// Envia alerta de notícia para clientes que ainda não viram
+func (nm *NewsMonitor) sendNewsAlertToClients(ticker string, news NewsItem) {
+	alert := NewsAlert{
+		Type:      "news_alert",
+		Ticker:    ticker,
+		News:      news,
+		Timestamp: time.Now(),
+	}
+
+	data, err := json.Marshal(alert)
+	if err != nil {
+		log.Printf("Erro ao serializar alerta de notícia: %v", err)
+		return
+	}
+
+	nm.wsMu.RLock()
+	defer nm.wsMu.RUnlock()
+
+	for conn, client := range nm.wsClients {
+		// Verifica se o cliente já viu essa notícia
+		client.mu.RLock()
+		seen := client.seenNews[news.ID]
+		client.mu.RUnlock()
+
+		if !seen {
+			// Marca como vista antes de enviar
+			client.mu.Lock()
+			client.seenNews[news.ID] = true
+			client.mu.Unlock()
+
+			// Envia a notícia
+			if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				conn.Close()
+				delete(nm.wsClients, conn)
+			}
+		}
+	}
+}
+
+// Envia todas as notícias não vistas do dia para um novo cliente
+func (nm *NewsMonitor) sendUnseenNewsToClient(client *WSClient, pm *PortfolioManager) {
+	// Pega todos os tickers da carteira
+	pm.mu.RLock()
+	tickers := make([]string, 0, len(pm.assets))
+	for ticker := range pm.assets {
+		tickers = append(tickers, ticker)
+	}
+	pm.mu.RUnlock()
+
+	// Pega todas as notícias do dia
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+
+	todayStart := time.Now().Truncate(24 * time.Hour).Unix()
+
+	for _, ticker := range tickers {
+		newsIDs, exists := nm.newsByTicker[ticker]
+		if !exists {
+			continue
+		}
+
+		for _, newsID := range newsIDs {
+			news, exists := nm.allNews[newsID]
+			if !exists || news.Published < todayStart {
+				continue
+			}
+
+			// Verifica se o cliente já viu
+			client.mu.RLock()
+			seen := client.seenNews[newsID]
+			client.mu.RUnlock()
+
+			if !seen {
+				// Marca como vista
+				client.mu.Lock()
+				client.seenNews[newsID] = true
+				client.mu.Unlock()
+
+				// Envia a notícia
+				alert := NewsAlert{
+					Type:      "news_alert",
+					Ticker:    ticker,
+					News:      news,
+					Timestamp: time.Now(),
+				}
+
+				if data, err := json.Marshal(alert); err == nil {
+					client.conn.WriteMessage(websocket.TextMessage, data)
+					// Pequeno delay entre notícias para não sobrecarregar o cliente
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
+		}
+	}
+}
+
+// Handler para API de notícias recentes
+func (nm *NewsMonitor) handleRecentNews(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+
+	// Retorna informações sobre notícias
+	todayStart := time.Now().Truncate(24 * time.Hour).Unix()
+	todayNewsCount := 0
+	for _, news := range nm.allNews {
+		if news.Published >= todayStart {
+			todayNewsCount++
+		}
+	}
+
+	response := struct {
+		TotalNewsCount int       `json:"totalNewsCount"`
+		TodayNewsCount int       `json:"todayNewsCount"`
+		LastCheck      time.Time `json:"lastCheck"`
+	}{
+		TotalNewsCount: len(nm.allNews),
+		TodayNewsCount: todayNewsCount,
+		LastCheck:      nm.lastCheck,
+	}
+
+	json.NewEncoder(w).Encode(response)
 }
 
 // Função para converter string de preço para float64
@@ -407,10 +698,10 @@ func (pm *PortfolioManager) broadcastUpdate(asset *Asset) {
 	pm.wsMu.RLock()
 	defer pm.wsMu.RUnlock()
 
-	for client := range pm.wsClients {
-		if err := client.WriteMessage(websocket.TextMessage, data); err != nil {
-			client.Close()
-			delete(pm.wsClients, client)
+	for conn := range pm.wsClients {
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			conn.Close()
+			delete(pm.wsClients, conn)
 		}
 	}
 }
@@ -424,13 +715,19 @@ func (pm *PortfolioManager) handleWebSocket(w http.ResponseWriter, r *http.Reque
 	}
 	defer conn.Close()
 
+	// Cria novo cliente com mapa de notícias visto
+	client := &WSClient{
+		conn:     conn,
+		seenNews: make(map[string]bool),
+	}
+
 	pm.wsMu.Lock()
-	pm.wsClients[conn] = true
+	pm.wsClients[conn] = client
 	pm.wsMu.Unlock()
 
 	log.Println("Novo cliente WebSocket conectado")
 
-	// Envia dados iniciais
+	// Envia dados iniciais de ativos
 	pm.mu.RLock()
 	for _, asset := range pm.assets {
 		asset.mu.RLock()
@@ -439,6 +736,11 @@ func (pm *PortfolioManager) handleWebSocket(w http.ResponseWriter, r *http.Reque
 		conn.WriteMessage(websocket.TextMessage, data)
 	}
 	pm.mu.RUnlock()
+
+	// Envia notícias não vistas do dia
+	if pm.newsMonitor != nil {
+		pm.newsMonitor.sendUnseenNewsToClient(client, pm)
+	}
 
 	// Mantém conexão aberta
 	for {
@@ -529,11 +831,17 @@ func main() {
 		log.Fatalf("Erro ao iniciar monitoramento: %v", err)
 	}
 
+	// Inicia monitoramento de notícias
+	log.Println("Iniciando monitoramento de notícias...")
+	pm.newsMonitor = NewNewsMonitor(pm.wsClients, &pm.wsMu)
+	pm.newsMonitor.StartMonitoring(pm)
+
 	// Configura rotas
 	r := mux.NewRouter()
 	r.HandleFunc("/", pm.handleIndex)
 	r.HandleFunc("/ws", pm.handleWebSocket)
 	r.HandleFunc("/api/portfolio", pm.handlePortfolioSummary).Methods("GET")
+	r.HandleFunc("/api/news/recent", pm.newsMonitor.handleRecentNews).Methods("GET")
 
 	// Serve arquivos estáticos (caso precise de CSS/JS separados no futuro)
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("./static/"))))
