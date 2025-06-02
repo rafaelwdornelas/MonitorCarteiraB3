@@ -216,19 +216,19 @@
             color: #888;
         }
 
-        /* Animação melhorada para atualização de preços */
-        @keyframes priceUpdate {
+        /* Animações para atualização de preços */
+        @keyframes priceIncrease {
             0% {
                 background-color: transparent;
             }
 
             25% {
-                background-color: rgba(0, 212, 255, 0.2);
+                background-color: rgba(74, 222, 128, 0.2);
                 transform: scale(1.01);
             }
 
             50% {
-                background-color: rgba(0, 212, 255, 0.3);
+                background-color: rgba(74, 222, 128, 0.3);
                 transform: scale(1.02);
             }
 
@@ -238,8 +238,34 @@
             }
         }
 
-        .price-update {
-            animation: priceUpdate 1s ease-in-out !important;
+        @keyframes priceDecrease {
+            0% {
+                background-color: transparent;
+            }
+
+            25% {
+                background-color: rgba(248, 113, 113, 0.2);
+                transform: scale(1.01);
+            }
+
+            50% {
+                background-color: rgba(248, 113, 113, 0.3);
+                transform: scale(1.02);
+            }
+
+            100% {
+                background-color: transparent;
+                transform: scale(1);
+            }
+        }
+
+        .price-increase {
+            animation: priceIncrease 1s ease-in-out !important;
+            position: relative !important;
+        }
+
+        .price-decrease {
+            animation: priceDecrease 1s ease-in-out !important;
             position: relative !important;
         }
 
@@ -493,6 +519,12 @@
                     existingAsset.currentTotal !== data.currentTotal ||
                     existingAsset.profitLoss !== data.profitLoss);
 
+            // Detecta se o preço aumentou ou diminuiu
+            let priceDirection = null;
+            if (existingAsset && existingAsset.currentPrice !== data.currentPrice) {
+                priceDirection = data.currentPrice > existingAsset.currentPrice ? 'increase' : 'decrease';
+            }
+
             assets[data.ticker] = data;
 
             // Organiza por tipo
@@ -508,13 +540,13 @@
                 updateTotals();
             } else if (isPriceUpdate) {
                 // Se for apenas atualização de preço, atualiza só a linha
-                updateSpecificRow(data, type);
+                updateSpecificRow(data, type, priceDirection);
                 updateTotals();
                 updateSectionStats(type);
             }
         }
 
-        function updateSpecificRow(asset, type) {
+        function updateSpecificRow(asset, type, priceDirection) {
             const tbody = document.getElementById(`tbody-${type}`);
             if (!tbody) {
                 renderTables();
@@ -541,15 +573,22 @@
                     cells[7].className = getColorClass(asset.profitLossPerc);
                     cells[7].textContent = formatPercent(asset.profitLossPerc);
 
-                    // Aplica animação
-                    row.classList.remove('price-update');
+                    // Remove classes de animação antigas
+                    row.classList.remove('price-increase', 'price-decrease');
+
                     // Força reflow
                     void row.offsetWidth;
-                    row.classList.add('price-update');
+
+                    // Aplica animação baseada na direção do preço
+                    if (priceDirection === 'increase') {
+                        row.classList.add('price-increase');
+                    } else if (priceDirection === 'decrease') {
+                        row.classList.add('price-decrease');
+                    }
 
                     // Remove animação após conclusão
                     setTimeout(() => {
-                        row.classList.remove('price-update');
+                        row.classList.remove('price-increase', 'price-decrease');
                     }, 1000);
 
                     //console.log(`Atualização aplicada em ${asset.ticker} (${type})`);
