@@ -185,6 +185,25 @@
             font-size: 0.9rem;
         }
 
+        /* Estilos para links do ticker - mantém cor original */
+        .ticker a {
+            color: inherit;
+            text-decoration: none;
+        }
+
+        .ticker a:visited {
+            color: inherit;
+        }
+
+        .ticker a:hover {
+            color: inherit;
+            text-decoration: underline;
+        }
+
+        .ticker a:active {
+            color: inherit;
+        }
+
         .positive {
             color: #4ade80;
         }
@@ -283,6 +302,97 @@
                 font-size: 0.8rem;
             }
         }
+
+        /* Estilos para notificações de notícias */
+        .news-notification {
+            position: fixed;
+            top: 60px;
+            right: 15px;
+            max-width: 400px;
+            background: #1a1a1a;
+            border: 1px solid #00d4ff;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 4px 20px rgba(0, 212, 255, 0.3);
+            animation: slideIn 0.3s ease-out;
+            z-index: 1000;
+            margin-bottom: 10px;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(400px);
+                opacity: 0;
+            }
+
+            to {
+                transform: translateX(0);
+                opacity: 1;
+            }
+        }
+
+        .news-notification-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .news-ticker {
+            font-weight: bold;
+            color: #00d4ff;
+            font-size: 0.9rem;
+        }
+
+        .news-urgency {
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.7rem;
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .news-urgency-high {
+            background: rgba(248, 113, 113, 0.2);
+            color: #f87171;
+        }
+
+        .news-title {
+            font-size: 0.85rem;
+            margin-bottom: 8px;
+            line-height: 1.4;
+        }
+
+        .news-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.75rem;
+            color: #888;
+        }
+
+        .news-link {
+            color: #00d4ff;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .news-link:hover {
+            text-decoration: underline;
+        }
+
+        .close-notification {
+            cursor: pointer;
+            color: #888;
+            font-size: 1.2rem;
+            line-height: 1;
+            padding: 0;
+            background: none;
+            border: none;
+        }
+
+        .close-notification:hover {
+            color: #fff;
+        }
     </style>
 </head>
 
@@ -325,6 +435,35 @@
         let currentSort = {};
         let collapsedSections = {};
         let isFirstLoad = true;
+
+        // Cria o objeto de áudio para notificações
+        function initNotificationSound() {
+            // Usa o Web Audio API para criar um som de notificação
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+            window.playNotificationSound = function () {
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+
+                oscillator.frequency.value = 800;
+                oscillator.type = 'sine';
+
+                gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+
+                oscillator.start(audioContext.currentTime);
+                oscillator.stop(audioContext.currentTime + 0.5);
+            };
+        }
+
+        // Inicializa o som quando o usuário interage com a página
+        document.addEventListener('click', function initSound() {
+            initNotificationSound();
+            document.removeEventListener('click', initSound);
+        }, { once: true });
 
         function formatCurrency(value) {
             return new Intl.NumberFormat('pt-BR', {
@@ -413,7 +552,7 @@
                         row.classList.remove('price-update');
                     }, 1000);
 
-                    console.log(`Atualização aplicada em ${asset.ticker} (${type})`);
+                    //console.log(`Atualização aplicada em ${asset.ticker} (${type})`);
                     break;
                 }
             }
@@ -631,7 +770,7 @@
                 row.dataset.profitLossPerc = asset.profitLossPerc;
 
                 row.innerHTML = `
-                    <td class="ticker">${asset.ticker}</td>
+                    <td class="ticker"><a href="https://br.tradingview.com/chart/?symbol=BMFBOVESPA:${asset.ticker}" target="_blank">${asset.ticker}</a></td>
                     <td>${asset.quantity.toFixed(2)}</td>
                     <td>${formatCurrency(asset.averagePrice)}</td>
                     <td>${formatCurrency(asset.totalInvested)}</td>
@@ -725,7 +864,14 @@
 
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
-                updateAsset(data);
+
+                // Verifica se é uma notificação de notícia
+                if (data.type === 'news_alert') {
+                    handleNewsAlert(data);
+                } else {
+                    // É uma atualização de ativo
+                    updateAsset(data);
+                }
             };
 
             ws.onerror = (error) => {
@@ -743,6 +889,51 @@
                     }, 5000);
                 }
             };
+        }
+
+        // Função para lidar com alertas de notícias
+        function handleNewsAlert(alert) {
+            console.log('Nova notícia recebida:', alert);
+
+            // Toca som de notificação
+            if (window.playNotificationSound) {
+                window.playNotificationSound();
+            }
+
+            // Cria notificação visual
+            showNewsNotification(alert);
+        }
+
+        // Função para mostrar notificação de notícia
+        function showNewsNotification(alert) {
+            const notification = document.createElement('div');
+            notification.className = 'news-notification';
+            notification.style.top = `${60 + document.querySelectorAll('.news-notification').length * 110}px`;
+
+            const urgencyClass = alert.news.urgency >= 3 ? 'news-urgency-high' : '';
+            const urgencyText = alert.news.urgency >= 3 ? 'URGENTE' : 'Nova notícia';
+
+            notification.innerHTML = `
+                <div class="news-notification-header">
+                    <span class="news-ticker">${alert.ticker}</span>
+                    <button class="close-notification" onclick="this.parentElement.parentElement.remove()">×</button>
+                </div>
+                <div class="news-urgency ${urgencyClass}">${urgencyText}</div>
+                <div class="news-title">${alert.news.title}</div>
+                <div class="news-footer">
+                    <span>${new Date(alert.news.published * 1000).toLocaleTimeString('pt-BR')}</span>
+                    <a href="https://br.tradingview.com/news-flow/?symbol=BMFBOVESPA:${alert.ticker}" target="_blank" class="news-link">Ver notícia →</a>
+                </div>
+            `;
+
+            document.body.appendChild(notification);
+
+            // Remove automaticamente após 30 segundos
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.remove();
+                }
+            }, 30000);
         }
 
         // Inicia conexão
