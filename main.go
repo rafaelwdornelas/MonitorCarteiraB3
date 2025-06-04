@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"sort"
@@ -130,6 +132,31 @@ type PortfolioManager struct {
 	wsMu        sync.RWMutex
 	config      *Config
 	newsMonitor *NewsMonitor
+}
+
+// Estrutura para resposta detalhada do ativo
+type AssetDetailResponse struct {
+	Asset        *Asset        `json:"asset"`
+	Transactions []Transaction `json:"transactions"`
+	PriceHistory []PricePoint  `json:"priceHistory"`
+	News         []NewsItem    `json:"news"`
+	Statistics   AssetStats    `json:"statistics"`
+}
+
+// Estrutura para ponto de preço histórico
+type PricePoint struct {
+	Date      string  `json:"date"`
+	Price     float64 `json:"price"`
+	Variation float64 `json:"variation"`
+}
+
+// Estrutura para estatísticas do ativo
+type AssetStats struct {
+	Min30Days       float64 `json:"min30Days"`
+	Max30Days       float64 `json:"max30Days"`
+	Variation30Days float64 `json:"variation30Days"`
+	Volatility      float64 `json:"volatility"`
+	TotalDividends  float64 `json:"totalDividends"`
 }
 
 var upgrader = websocket.Upgrader{
@@ -793,6 +820,201 @@ func (pm *PortfolioManager) handlePortfolioSummary(w http.ResponseWriter, r *htt
 	json.NewEncoder(w).Encode(summary)
 }
 
+func (pm *PortfolioManager) handleAssetDetailPage(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "asset-detail.html")
+}
+
+// Handler para detalhes do ativo
+func (pm *PortfolioManager) handleAssetDetails(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Pega o ticker dos parâmetros da rota (gorilla/mux)
+	vars := mux.Vars(r)
+	ticker := vars["ticker"]
+
+	if ticker == "" {
+		http.Error(w, "Ticker não especificado", http.StatusBadRequest)
+		return
+	}
+
+	pm.mu.RLock()
+	asset, exists := pm.assets[ticker]
+	pm.mu.RUnlock()
+
+	if !exists {
+		http.Error(w, "Ativo não encontrado", http.StatusNotFound)
+		return
+	}
+
+	// Busca transações do ativo
+	transactions := pm.getAssetTransactions(ticker)
+
+	// Gera histórico de preços (simulado por enquanto)
+	priceHistory := pm.generatePriceHistory(asset)
+
+	// Busca notícias do ativo
+	news := pm.getAssetNews(ticker)
+
+	// Calcula estatísticas
+	stats := pm.calculateAssetStats(asset, priceHistory)
+
+	response := AssetDetailResponse{
+		Asset:        asset,
+		Transactions: transactions,
+		PriceHistory: priceHistory,
+		News:         news,
+		Statistics:   stats,
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
+// Busca transações de um ativo específico
+func (pm *PortfolioManager) getAssetTransactions(ticker string) []Transaction {
+	// Por enquanto, vamos retornar as transações armazenadas
+	// Em produção, isso viria do banco de dados ou da API
+	url := fmt.Sprintf("%s/%s/1?draw=1", pm.config.Investidor10URL, pm.config.Investidor10ID)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Printf("Erro ao buscar transações: %v", err)
+		return []Transaction{}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return []Transaction{}
+	}
+
+	var apiResp APIResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return []Transaction{}
+	}
+
+	// Filtra apenas as transações do ticker solicitado
+	var transactions []Transaction
+	for _, tx := range apiResp.Data {
+		if tx.Ticker == ticker {
+			transactions = append(transactions, tx)
+		}
+	}
+
+	// Ordena por data (mais recente primeiro)
+	sort.Slice(transactions, func(i, j int) bool {
+		dateI := parseDate(transactions[i].Date)
+		dateJ := parseDate(transactions[j].Date)
+		return dateI.After(dateJ)
+	})
+
+	return transactions
+}
+
+// Gera histórico de preços simulado
+func (pm *PortfolioManager) generatePriceHistory(asset *Asset) []PricePoint {
+	history := make([]PricePoint, 0, 30)
+
+	// Simula 30 dias de histórico
+	basePrice := asset.AveragePrice
+	currentDate := time.Now()
+
+	for i := 29; i >= 0; i-- {
+		date := currentDate.AddDate(0, 0, -i)
+
+		// Simula variação de preço
+		variation := (rand.Float64() - 0.5) * 0.1
+		price := basePrice * (1 + variation)
+
+		history = append(history, PricePoint{
+			Date:      date.Format("2006-01-02"),
+			Price:     price,
+			Variation: variation * 100,
+		})
+	}
+
+	// Último ponto é o preço atual
+	if len(history) > 0 && asset.CurrentPrice > 0 {
+		history[len(history)-1].Price = asset.CurrentPrice
+		history[len(history)-1].Variation = ((asset.CurrentPrice / asset.AveragePrice) - 1) * 100
+	}
+
+	return history
+}
+
+// Busca notícias do ativo
+func (pm *PortfolioManager) getAssetNews(ticker string) []NewsItem {
+	if pm.newsMonitor == nil {
+		return []NewsItem{}
+	}
+
+	pm.newsMonitor.mu.RLock()
+	defer pm.newsMonitor.mu.RUnlock()
+
+	newsIDs, exists := pm.newsMonitor.newsByTicker[ticker]
+	if !exists {
+		return []NewsItem{}
+	}
+
+	// Pega as notícias mais recentes (últimos 10)
+	var news []NewsItem
+	count := 0
+	for i := len(newsIDs) - 1; i >= 0 && count < 10; i-- {
+		if item, exists := pm.newsMonitor.allNews[newsIDs[i]]; exists {
+			news = append(news, item)
+			count++
+		}
+	}
+
+	return news
+}
+
+// Calcula estatísticas do ativo
+func (pm *PortfolioManager) calculateAssetStats(asset *Asset, priceHistory []PricePoint) AssetStats {
+	if len(priceHistory) == 0 {
+		return AssetStats{}
+	}
+
+	// Encontra mínimo e máximo
+	min := priceHistory[0].Price
+	max := priceHistory[0].Price
+
+	for _, point := range priceHistory {
+		if point.Price < min {
+			min = point.Price
+		}
+		if point.Price > max {
+			max = point.Price
+		}
+	}
+
+	// Calcula variação 30 dias
+	var variation30Days float64
+	if len(priceHistory) > 0 && priceHistory[0].Price > 0 {
+		firstPrice := priceHistory[0].Price
+		lastPrice := priceHistory[len(priceHistory)-1].Price
+		variation30Days = ((lastPrice / firstPrice) - 1) * 100
+	}
+
+	// Calcula volatilidade (desvio padrão simplificado)
+	var sum, sumSquares float64
+	for _, point := range priceHistory {
+		sum += point.Price
+		sumSquares += point.Price * point.Price
+	}
+
+	mean := sum / float64(len(priceHistory))
+	variance := (sumSquares / float64(len(priceHistory))) - (mean * mean)
+	volatility := math.Sqrt(variance) / mean * 100
+
+	return AssetStats{
+		Min30Days:       min,
+		Max30Days:       max,
+		Variation30Days: variation30Days,
+		Volatility:      volatility,
+		TotalDividends:  0, // Implementar quando tivermos dados de proventos
+	}
+}
+
 func main() {
 	// Carrega configurações
 	config := loadConfig()
@@ -842,6 +1064,10 @@ func main() {
 	r.HandleFunc("/ws", pm.handleWebSocket)
 	r.HandleFunc("/api/portfolio", pm.handlePortfolioSummary).Methods("GET")
 	r.HandleFunc("/api/news/recent", pm.newsMonitor.handleRecentNews).Methods("GET")
+
+	// NOVAS ROTAS:
+	r.HandleFunc("/asset-detail.html", pm.handleAssetDetailPage).Methods("GET")
+	r.HandleFunc("/api/asset/{ticker}", pm.handleAssetDetails).Methods("GET")
 
 	// Serve arquivos estáticos (caso precise de CSS/JS separados no futuro)
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("./static/"))))

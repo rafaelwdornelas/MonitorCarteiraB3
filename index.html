@@ -809,7 +809,7 @@
                 row.dataset.profitLossPerc = asset.profitLossPerc;
 
                 row.innerHTML = `
-                    <td class="ticker"><a href="https://br.tradingview.com/chart/?symbol=BMFBOVESPA:${asset.ticker}" target="_blank">${asset.ticker}</a></td>
+                    <td class="ticker"><a href="/asset-detail.html?ticker=${asset.ticker}">${asset.ticker}</a></td>
                     <td>${asset.quantity.toFixed(2)}</td>
                     <td>${formatCurrency(asset.averagePrice)}</td>
                     <td>${formatCurrency(asset.totalInvested)}</td>
